@@ -34,6 +34,7 @@ import json
 import os
 import random
 import sys
+import threading as _threading
 import time
 from typing import Any, Optional
 
@@ -60,26 +61,101 @@ try:
 except Exception:  # pragma: no cover
     _HAS_TREYS = False
 
+# ─── LLM mode configuration ───────────────────────────────────────────
+# MODE selects the decision architecture. Default "heuristic" = current
+# proven code, zero LLM calls, zero cost. "analyst" = heuristic decisions
+# PLUS periodic Haiku strategic adjustments. "llm" = delegate to llm_agent.
+_AGENT_MODE = os.environ.get("AGENT_MODE", "heuristic").lower()
 
-POLL_INTERVAL = 1.0        # tight pending-actions poll (halved from 2.0 in 0.3.2)
-POLL_JITTER = 0.5
+# Analyst layer state — only used when MODE=analyst.
+_ANALYST_INTERVAL = int(os.environ.get("ANALYST_INTERVAL", "25"))  # consult every N decisions
+_analyst_adjustments: dict = {}      # current multipliers (empty = neutral)
+_analyst_window: list = []           # rolling telemetry window for the analyst
+_decisions_since_analyst = 0         # counter
+_analyst_busy = False                # True while a consult thread is running
+
+try:
+    from llm_client import consult_analyst, llm_available
+    _HAS_LLM_CLIENT = True
+except Exception:
+    _HAS_LLM_CLIENT = False
+    def consult_analyst(records, model=None):  # type: ignore
+        return {}
+    def llm_available():  # type: ignore
+        return False
+
+
+POLL_INTERVAL = 2.0        # tight pending-actions poll (halved from 2.0 in 0.3.2)
+POLL_JITTER = 0.25
 STATUS_REFRESH_S = 8.0      # background refresh of benchmark/status
 
 
 # ─── Auto Research hook ───────────────────────────────────────────
 # Called immediately before decide(table) on every fresh pending table.
-# Default impl is a no-op. Plug in real research by overriding this with:
-#   - examples/research_static_chart.py (runnable preflop chart example)
-#   - GTOWizard API (free 100/day tier)
-#   - WASM Postflop / TexasSolver retrieval
-#   - opponent HUD from /texas/agent-stats?agentId=...
+# Accumulates per-opponent stats across hands and returns a summary dict.
 # See docs/strategy.md "Auto Research" for the L2/L3 wiring pattern.
+
+# Module-level opponent profile accumulator — persists across hands in a
+# single process run. Resets on process restart (by design: each benchmark
+# match is a fresh 500-hand session).
+_opponent_profiles: dict[str, dict] = {}
+
+
+def _update_opponent_profiles(table: dict) -> None:
+    """Extract observable opponent actions from recentEvents and accumulate
+    stats. Called once per pending table before decide()."""
+    events = table.get("recentEvents") or []
+    self_seat = table.get("selfSeatNumber")
+    street = (table.get("street") or "Preflop").lower()
+
+    for ev in events:
+        seat_num = ev.get("seatNumber")
+        if seat_num is None or seat_num == self_seat:
+            continue
+        agent_id = ev.get("agentId") or ev.get("agentHandle") or f"seat_{seat_num}"
+        if agent_id not in _opponent_profiles:
+            _opponent_profiles[agent_id] = {
+                "hands_seen": 0, "vpip_count": 0, "pfr_count": 0,
+                "agg_actions": 0, "passive_actions": 0,
+                "fold_to_cbet": 0, "cbet_opportunities": 0,
+            }
+        prof = _opponent_profiles[agent_id]
+        action = (ev.get("action") or "").lower()
+
+        if street == "preflop":
+            if action in ("call", "raise", "bet", "all-in"):
+                prof["vpip_count"] += 1
+            if action in ("raise", "bet", "all-in"):
+                prof["pfr_count"] += 1
+
+        if action in ("raise", "bet", "all-in"):
+            prof["agg_actions"] += 1
+        elif action in ("call", "check"):
+            prof["passive_actions"] += 1
+
+
+def _get_opponent_summary() -> dict:
+    """Return a compact summary of all tracked opponents for logging and
+    future exploitative adjustments."""
+    summary: dict[str, dict] = {}
+    for agent_id, prof in _opponent_profiles.items():
+        total = prof["agg_actions"] + prof["passive_actions"]
+        summary[agent_id] = {
+            "vpip": prof["vpip_count"],
+            "pfr": prof["pfr_count"],
+            "agg_pct": round(prof["agg_actions"] / max(total, 1), 2),
+            "sample": total,
+        }
+    return summary
+
+
 def retrieve_solver_context(table: dict) -> dict:
     """Return a small dict of extra context for decide() / llm_decide().
-    Empty by default. Builders override this and pass the result into their
-    own decide() implementation. The L2 (LLM) and L3 (trained weights) paths
-    benefit the most — see docs/strategy.md."""
-    return {}
+    Accumulates per-opponent stats and returns them each hand."""
+    _update_opponent_profiles(table)
+    return {
+        "opponents": _get_opponent_summary(),
+    }
 
 
 # ─── Hand strength estimation (treys) ─────────────────────────────────
@@ -164,84 +240,418 @@ def _to_treys(card_str: str) -> str:
     return r + s
 
 
+# ─── Textured strategy constants ─────────────────────────────────────
+
+# 6-max NLHE opening ranges (from decide_textured.py reference).
+OPENING_RANGES = {
+    "UTG": {"AA","KK","QQ","JJ","TT","99","AKs","AKo","AQs"},
+    "MP":  {"AA","KK","QQ","JJ","TT","99","88","AKs","AKo","AQs","AQo","AJs","KQs"},
+    "CO":  {"AA","KK","QQ","JJ","TT","99","88","77","66","55",
+            "AKs","AKo","AQs","AQo","AJs","AJo","ATs","KQs","KQo","KJs","KTs",
+            "QJs","QTs","JTs","T9s","98s"},
+    "BTN": {"AA","KK","QQ","JJ","TT","99","88","77","66","55","44","33","22",
+            "AKs","AKo","AQs","AQo","AJs","AJo","ATs","ATo",
+            "A9s","A8s","A7s","A6s","A5s","A4s","A3s","A2s",
+            "KQs","KQo","KJs","KJo","KTs","K9s",
+            "QJs","QTs","Q9s","JTs","J9s","T9s","98s","87s","76s"},
+    "SB":  {"AA","KK","QQ","JJ","TT","99","88","AKs","AKo","AQs","AQo","AJs","ATs","KQs","KJs","QJs"},
+    "BB":  {"AA","KK","QQ","JJ","TT","AKs","AKo","AQs"},
+}
+
+# BB defend range — wider than BB open range (defending against opens).
+BB_DEFEND = OPENING_RANGES["BB"] | {
+    "99","88","77",
+    "KQs","KQo",
+    "KJs","KJo",
+    "QJs","QJo",
+    "AQo",
+    "JTs","T9s","98s",
+}
+
+# 6-max seat → position heuristic.
+SEAT_TO_POS = {1: "BTN", 2: "SB", 3: "BB", 4: "UTG", 5: "MP", 6: "CO"}
+
+# Bet sizing per board texture (fraction of pot).
+SIZING = {
+    "dry":      {"flop": 0.33, "turn": 0.50, "river": 0.66},
+    "wet":      {"flop": 0.66, "turn": 0.75, "river": 0.75},
+    "neutral":  {"flop": 0.50, "turn": 0.60, "river": 0.66},
+}
+
+
+def _board_texture(board: list[str]) -> str:
+    """Classify board as dry / wet / neutral based on draw density.
+
+    wet  = monotone, flush draw present (3+ same suit),
+           two-tone + connected, or 4+ card connected board with
+           suit repetition (flush threat exists).
+    dry  = no flush threat (max suit count <= 2) AND no straight
+           threat (rank span > 5) AND not paired.
+    neutral = everything else (connected rainbow, two-tone disconnected).
+    """
+    if len(board) < 3:
+        return "neutral"
+    suits = [c[-1].lower() for c in board]
+    ranks_str = "23456789TJQKA"
+    ranks = sorted(ranks_str.index(c[0].upper()) for c in board
+                   if c[0].upper() in ranks_str)
+
+    suit_counts = {s: suits.count(s) for s in set(suits)}
+    max_suit    = max(suit_counts.values())
+    monotone    = len(set(suits)) == 1
+    three_flush = max_suit >= 3
+    two_tone    = len(set(suits)) == 2
+    connected   = len(ranks) >= 2 and (max(ranks) - min(ranks)) <= 4
+    paired      = len(set(c[0].upper() for c in board)) < len(board)
+    span        = (max(ranks) - min(ranks)) if len(ranks) >= 2 else 99
+
+    if monotone or three_flush:
+        return "wet"
+    if two_tone and connected:
+        return "wet"
+    if len(board) >= 4 and connected and max_suit >= 2:
+        return "wet"
+    if max_suit <= 2 and span > 5 and not paired:
+        return "dry"
+    if paired and not connected and max_suit < 3:
+        return "dry"
+    return "neutral"
+
+
+def _street_from_board(board_cards: list[str]) -> str:
+    """Return street name from board card count."""
+    if not board_cards:
+        return "preflop"
+    return ("flop", "turn", "river")[max(0, min(len(board_cards) - 3, 2))]
+
+
+# ─── Telemetry logger ────────────────────────────────────────────────
+
+import datetime as _datetime
+import pathlib as _pathlib
+
+_TELEMETRY_PATH = _pathlib.Path("hand_telemetry.jsonl")
+
+
+def _log_decision(table: dict, action_name: str, amount: Optional[int],
+                  equity: float, pot_odds: float, position: str,
+                  hand_class: str, texture: str, street: str,
+                  research_context: Optional[dict] = None,
+                  note: str = "") -> None:
+    """Append a structured JSON record per decision for failure analysis.
+    Never raises — telemetry must not crash the agent.
+
+    note tags non-mainline paths (e.g. "deadline_fallback", "wire_400_fallback")
+    so the analysis can tell heuristic decisions apart from blind fallbacks."""
+    try:
+        self_seat_num = table.get("selfSeatNumber")
+        seats = table.get("seats") or []
+        self_seat = next((s for s in seats if s.get("seatNumber") == self_seat_num), {})
+        record = {
+            "ts": _datetime.datetime.now(_datetime.timezone.utc).isoformat(),
+            "hand_id": table.get("tableId", ""),
+            "position": position,
+            "hand_class": hand_class,
+            "street": street,
+            "board": list(table.get("boardCards") or []),
+            "texture": texture,
+            "pot": int(table.get("potChips") or 0),
+            "call_chips": int((table.get("allowedActions") or {}).get("callChips") or 0),
+            "pot_odds": round(pot_odds, 3),
+            "equity": round(equity, 3),
+            "action": action_name,
+            "amount": amount,
+            "stack": int(self_seat.get("stackChips") or 0),
+            "opponents": (research_context or {}).get("opponents", {}),
+            "note": note,
+        }
+        with open(_TELEMETRY_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass  # telemetry must never crash the agent
+
+
 # ─── decide() — the part builders edit ────────────────────────────────
+
+def _adj(key: str, default: float = 1.0) -> float:
+    """Read a live analyst multiplier (1.0 = neutral when no analyst active)."""
+    return float(_analyst_adjustments.get(key, default))
+
+
+def _run_analyst_async(window_snapshot: list) -> None:
+    """LLM consult body — always runs in a daemon thread, never inline.
+
+    All exceptions are caught here; a failed consult just leaves the existing
+    _analyst_adjustments in place. _analyst_busy is cleared in finally so the
+    next trigger fires correctly even if this call errors or times out."""
+    global _analyst_adjustments, _analyst_busy
+    try:
+        new_adj = consult_analyst(window_snapshot)
+        if new_adj:
+            _analyst_adjustments = new_adj
+            print(f"[arena-pokerkit] analyst update: {new_adj}",
+                  file=sys.stderr)
+    except Exception as e:
+        print(f"[arena-pokerkit] analyst consult failed: {e}",
+              file=sys.stderr)
+    finally:
+        _analyst_busy = False   # always release, even on exception or timeout
+
+
+def _maybe_consult_analyst(record: dict) -> None:
+    """Accumulate telemetry; fire Haiku in a daemon thread when due.
+
+    Fire-and-forget: _threading.Thread is started and immediately released.
+    The action POST (and all subsequent logic) is never blocked by the LLM
+    round-trip. Multipliers written by the thread apply to future hands only.
+
+    Overlap guard: if a consult thread is still running when the next trigger
+    fires, the new trigger is skipped (counter is NOT reset) so the thread
+    fires on the very next hand after the current one finishes."""
+    global _decisions_since_analyst, _analyst_busy
+    if _AGENT_MODE != "analyst" or not _HAS_LLM_CLIENT:
+        return
+    _analyst_window.append(record)
+    if len(_analyst_window) > 60:
+        del _analyst_window[:-60]
+    _decisions_since_analyst += 1
+    if _decisions_since_analyst >= _ANALYST_INTERVAL and llm_available():
+        if _analyst_busy:
+            return   # previous thread still running; retry next hand
+        _decisions_since_analyst = 0
+        _analyst_busy = True
+        _threading.Thread(
+            target=_run_analyst_async,
+            args=(list(_analyst_window),),  # snapshot; thread owns its copy
+            daemon=True,
+        ).start()
+
+
+def _compute_position(self_seat_num: int, table: dict) -> str:
+    """Compute relative position from dealer seat rather than using
+    a static seat-number mapping. Handles button rotation correctly."""
+    seats = table.get("seats") or []
+    active_seats = sorted(
+        s["seatNumber"] for s in seats if s.get("seatNumber") is not None
+    )
+    n = len(active_seats)
+    if n == 0:
+        return "MP"
+
+    dealer_seat = table.get("dealerSeatNumber") or table.get("buttonSeat")
+    if dealer_seat is None:
+        # Infer BTN from BlindPosted events: first blind posted = SB, BTN is one before SB.
+        blind_events = sorted(
+            [e for e in (table.get("recentEvents") or []) if e.get("type") == "BlindPosted"],
+            key=lambda e: e.get("sequence", 0),
+        )
+        if blind_events:
+            sb_seat = (blind_events[0].get("summary") or {}).get("seatNumber")
+            if sb_seat in active_seats:
+                dealer_seat = active_seats[(active_seats.index(sb_seat) - 1) % n]
+    if dealer_seat is None or self_seat_num not in active_seats or dealer_seat not in active_seats:
+        return SEAT_TO_POS.get(self_seat_num, "MP")
+
+    dealer_idx = active_seats.index(dealer_seat)
+    self_idx   = active_seats.index(self_seat_num)
+    offset     = (self_idx - dealer_idx) % n
+
+    if n <= 3:
+        pos_map = {0: "BTN", 1: "SB", 2: "BB"}
+    elif n == 4:
+        pos_map = {0: "BTN", 1: "SB", 2: "BB", 3: "UTG"}
+    elif n == 5:
+        pos_map = {0: "BTN", 1: "SB", 2: "BB", 3: "UTG", 4: "CO"}
+    else:
+        pos_map = {0: "BTN", 1: "SB", 2: "BB", 3: "UTG", 4: "MP", 5: "CO"}
+
+    return pos_map.get(offset, "MP")
+
 
 def decide(table: dict, deadline_s: float = 10.0,
            research_context: Optional[dict] = None) -> dict:
     """Return one action: {action, amount?, message, reasoning}.
 
-    Reasoning is YAML flow style, max 150 chars, required on benchmark tables:
-      {vr: "<range>", ke: "<num+unit>", bf: [<features>], pp: "<plan>", sr: "<size reason>"}
+    Textured + Monte Carlo hybrid with structured telemetry logging.
+    Uses position-aware ranges preflop, board-texture-aware sizing postflop,
+    and Monte Carlo equity from treys for postflop decisions.
 
     research_context is an optional dict from retrieve_solver_context() —
-    L1 ignores it. L2/L3 should consult it (preflop charts, postflop
-    solver frequencies, opponent style)."""
+    contains opponent profile summaries for future exploitative adjustments."""
     allowed = table.get("allowedActions") or {}
     available = allowed.get("availableActions") or []
 
-    # Deadline fallback: prefer check, then small call, then fold.
+    # Deadline fallback: prefer check, then fold.
     if deadline_s < 2.0:
+        # Cheap pure-dict lookups — safe to compute even under time pressure —
+        # so the fallback hand still lands in telemetry (note="deadline_fallback").
+        _self_num = table.get("selfSeatNumber") or 0
+        _seat = next((s for s in (table.get("seats") or [])
+                      if s.get("seatNumber") == _self_num), {})
+        _hole = list(_seat.get("holeCards") or [])
+        _board = list(table.get("boardCards") or [])
+        _street = _street_from_board(_board)
+        _pos = _compute_position(_self_num, table)
+        _cls = _hand_class(_hole)
+        _texture = _board_texture(_board) if _board else "neutral"
+        _call = int(allowed.get("callChips") or 0)
+        _pot = int(table.get("potChips") or 0)
+        _po = _call / max(_pot + _call, 1) if _call else 0.0
         if allowed.get("canCheck"):
+            _log_decision(table, "check", None, 0.5, _po, _pos, _cls, _texture,
+                          _street, research_context, note="deadline_fallback")
             return _build("check", None, table, allowed, eq=0.5, po=0.0,
                           msg="deadline tight, taking free option")
+        _log_decision(table, "fold", None, 0.0, _po, _pos, _cls, _texture,
+                      _street, research_context, note="deadline_fallback")
         return _build("fold", None, table, allowed, eq=0.0, po=1.0,
                       msg="deadline tight and price not justified")
 
-    self_seat_num = table.get("selfSeatNumber")
+    # MODE=llm delegates the whole decision to the pure-LLM agent.
+    if _AGENT_MODE == "llm":
+        try:
+            from llm_agent import llm_decide
+            return llm_decide(table, deadline_s=deadline_s,
+                              research_context=research_context)
+        except Exception as e:
+            print(f"[arena-pokerkit] llm mode failed ({e}), "
+                  "falling back to heuristic", file=sys.stderr)
+    # MODE=heuristic and MODE=analyst both continue through the code below.
+
+    self_seat_num = table.get("selfSeatNumber") or 0
     seats = table.get("seats") or []
     self_seat = next((s for s in seats if s.get("seatNumber") == self_seat_num), {})
     hole = list(self_seat.get("holeCards") or [])
     board = list(table.get("boardCards") or [])
-
+    street = _street_from_board(board)
+    pos = _compute_position(self_seat_num, table)
+    cls = _hand_class(hole)
     pot = int(table.get("potChips") or 0)
     call_chips = int(allowed.get("callChips") or 0)
     pot_odds = call_chips / max(pot + call_chips, 1) if call_chips else 0.0
+    texture = _board_texture(board) if board else "neutral"
 
+    # ── Preflop: range-based opens ──────────────────────────────────
+    big_blind = int(table.get("bigBlindChips") or 2)
+    if street == "preflop" and call_chips <= big_blind and cls:
+        if cls in OPENING_RANGES.get(pos, set()):
+            rr = allowed.get("raiseRange") or {}
+            lo = int(rr.get("min") or 4)
+            hi = int(rr.get("max") or lo)
+            amt = max(lo, min(lo * 2, hi))
+            action = "raise" if "raise" in available else ("bet" if "bet" in available else "check")
+            if action in ("raise", "bet"):
+                _log_decision(table, action, amt, _PREFLOP_EQUITY.get(cls, 0.45),
+                              pot_odds, pos, cls, texture, street, research_context)
+                return _build(action, amt, table, allowed,
+                              eq=_PREFLOP_EQUITY.get(cls, 0.45), po=pot_odds,
+                              msg=f"open {cls} from {pos}")
+        # Not in opening range — check or fold.
+        action = "check" if "check" in available else "fold"
+        _log_decision(table, action, None, _PREFLOP_EQUITY.get(cls, 0.30),
+                      pot_odds, pos, cls, texture, street, research_context)
+        return _build(action, None, table, allowed,
+                      eq=_PREFLOP_EQUITY.get(cls, 0.30), po=pot_odds,
+                      msg=f"{cls} not in {pos} range")
+
+    # ── Preflop: facing a bet (3-bet premiums, defend range, or fold) ──
+    _PREMIUM_3BET = {"AA", "KK", "QQ", "AKs", "AKo"}
+    if street == "preflop" and call_chips > big_blind and cls:
+        if cls in _PREMIUM_3BET and allowed.get("canRaise") and "raise" in available:
+            rr = allowed.get("raiseRange") or {}
+            lo = int(rr.get("min") or call_chips * 2)
+            hi = int(rr.get("max") or lo)
+            target = max(lo, min(call_chips * 3, hi))
+            eq = _PREFLOP_EQUITY.get(cls, 0.67)
+            _log_decision(table, "raise", target, eq,
+                          pot_odds, pos, cls, texture, street, research_context)
+            return _build("raise", target, table, allowed,
+                          eq=eq, po=pot_odds,
+                          msg=f"3-bet {cls} for value")
+        if cls in BB_DEFEND and pos == "BB" and "call" in available:
+            eq = _PREFLOP_EQUITY.get(cls, 0.45)
+            _log_decision(table, "call", None, eq,
+                          pot_odds, pos, cls, texture, street, research_context)
+            return _build("call", None, table, allowed,
+                          eq=eq, po=pot_odds,
+                          msg=f"defend {cls}")
+        action = "fold" if "fold" in available else "check"
+        _log_decision(table, action, None, _PREFLOP_EQUITY.get(cls, 0.25),
+                      pot_odds, pos, cls, texture, street, research_context)
+        return _build(action, None, table, allowed,
+                      eq=_PREFLOP_EQUITY.get(cls, 0.25), po=pot_odds,
+                      msg=f"{cls} not in defend range")
+
+    # ── Preflop fallback (no hole cards parsed) ─────────────────────
+    if street == "preflop":
+        action = "check" if "check" in available else "fold"
+        _log_decision(table, action, None, 0.40, pot_odds, pos, cls, texture,
+                      street, research_context)
+        return _build(action, None, table, allowed, eq=0.40, po=pot_odds,
+                      msg="preflop fallback")
+
+    # ── Postflop: Monte Carlo equity + texture-aware sizing ─────────
     equity = estimate_equity(hole, board, sims=200, deadline_s=deadline_s)
 
-    # Decision tree.
+    # Analyst-adjusted thresholds (all _adj() return 1.0 in heuristic mode,
+    # so this block is a no-op unless MODE=analyst is active).
+    _bet_th = max(0.30, min(0.6 / _adj("value_multiplier"), 0.95))
+    _raise_th = max(0.50, min(0.75 / _adj("value_multiplier"), 0.95))
+    if street == "river":
+        _bet_th = max(0.30, min(_bet_th / _adj("river_aggression"), 0.95))
+        _raise_th = max(0.50, min(_raise_th / _adj("river_aggression"), 0.95))
+    _wet_mult = _adj("wet_aggression") if texture == "wet" else 1.0
+
     action_name: str
     amount: Optional[int] = None
+
     if call_chips == 0:
-        # Free option: check or bet for value.
-        if equity > 0.7 and allowed.get("canBet"):
-            br = allowed.get("betRange") or {}
-            min_bet = int(br.get("min") or max(int(pot * 0.5), 1))
-            max_bet = int(br.get("max") or min_bet)
-            target = max(min_bet, min(int(pot * 0.66), max_bet))
-            action_name, amount = "bet", target
+        # Free option: value bet with strong hands, check weak.
+        if equity > _bet_th and (allowed.get("canBet") or allowed.get("canRaise")):
+            size = SIZING[texture][street] * _wet_mult
+            br = allowed.get("betRange") or allowed.get("raiseRange") or {}
+            lo = int(br.get("min") or 1)
+            hi = int(br.get("max") or lo)
+            amt = max(lo, min(int(pot * size), hi))
+            act = "bet" if "bet" in available else ("raise" if "raise" in available else "check")
+            if act in ("bet", "raise"):
+                action_name, amount = act, amt
+            else:
+                action_name = "check"
         elif "check" in available:
             action_name = "check"
-        elif "call" in available:
-            action_name = "call"
         else:
             action_name = "fold"
     else:
-        # Facing a bet.
+        # Facing a bet — use equity vs pot odds.
         if equity < pot_odds - 0.05 and "fold" in available:
             action_name = "fold"
-        elif equity > 0.8 and allowed.get("canRaise"):
+        elif equity > _raise_th and allowed.get("canRaise"):
+            # Strong hand — raise for value with texture-aware sizing.
+            size = SIZING[texture][street] * _wet_mult
             rr = allowed.get("raiseRange") or {}
-            min_raise = int(rr.get("min") or call_chips * 2)
-            max_raise = int(rr.get("max") or min_raise)
-            target = max(min_raise, min(int(pot * 0.66 + call_chips * 2), max_raise))
+            lo = int(rr.get("min") or call_chips * 2)
+            hi = int(rr.get("max") or lo)
+            target = max(lo, min(int(pot * size + call_chips), hi))
             action_name, amount = "raise", target
         elif equity >= pot_odds + 0.05 and "call" in available:
             action_name = "call"
-            # callToAmount = total committed this street after call
-            cta = allowed.get("callToAmount")
-            if cta is not None:
-                amount = int(cta)
         elif "check" in available:
             action_name = "check"
         else:
             action_name = "fold"
 
-    # Some validators reject `amount` on actions that don't take one. Strip it.
+    # Strip amount for actions that don't take one.
     if action_name in ("fold", "check", "call"):
-        # call MAY accept amount = callToAmount; the schema permits but doesn't
-        # require it. Safer to omit and let the server compute.
         amount = None
+
+    _log_decision(table, action_name, amount, equity, pot_odds, pos, cls,
+                  texture, street, research_context)
+    _maybe_consult_analyst({
+        "position": pos, "texture": texture, "street": street,
+        "action": action_name, "equity": equity, "pot_odds": pot_odds,
+        "opponents": (research_context or {}).get("opponents", {}),
+    })
 
     msg = _human_message(action_name, equity, pot_odds, hole)
     return _build(action_name, amount, table, allowed,
@@ -249,8 +659,10 @@ def decide(table: dict, deadline_s: float = 10.0,
 
 
 def _build(action: str, amount: Optional[int], table: dict, allowed: dict,
-           eq: float, po: float, msg: str) -> dict:
-    reasoning = _build_reasoning(action, eq, po, table, allowed)
+           eq: float, po: float, msg: str,
+           pos: str = "", texture: str = "") -> dict:
+    reasoning = _build_reasoning(action, eq, po, table, allowed,
+                                 pos=pos, texture=texture)
     payload: dict[str, Any] = {
         "action": action,
         "message": msg[:500],
@@ -266,19 +678,31 @@ _FALLBACK_REASONING = '{vr: "std", ke: "legal", pp: "pot control"}'
 
 
 def _build_reasoning(action: str, equity: float, pot_odds: float,
-                     table: dict, allowed: dict) -> str:
+                     table: dict, allowed: dict,
+                     pos: str = "", texture: str = "") -> str:
     """YAML flow style under 150 chars. Build capped field values first;
     fall back to a known-valid short object if the serialized string overflows,
-    never blind-slice to 150."""
+    never blind-slice to 150.
+
+    pos and texture should be the values already computed by decide() /
+    _compute_position() / _board_texture() — passed through _build() so we
+    never recompute or guess from raw seat numbers."""
     board = table.get("boardCards") or []
     street = (table.get("street") or "Preflop")
-    self_seat = table.get("selfSeatNumber") or 0
-    # crude position label
-    pos_label = "IP" if self_seat and self_seat % 2 == 0 else "OOP"
+    # Use the position already resolved by _compute_position(); fall back to
+    # IP/OOP only when pos is empty (e.g. the 400-fallback path).
+    if pos:
+        # Condense to IP/OOP for the reasoning string (keeps it short).
+        _ip_positions = {"BTN", "CO", "MP"}
+        pos_label = "IP" if pos in _ip_positions else "OOP"
+    else:
+        self_seat = table.get("selfSeatNumber") or 0
+        pos_label = "IP" if self_seat and self_seat % 2 == 0 else "OOP"
     plan_map = {"Preflop": "see flop", "Flop": "barrel T", "Turn": "ck R",
                 "River": "showdown"}
     pp = f"{pos_label} {plan_map.get(street, 'pot ctrl')}"[:30]
-    # board features
+    # Board features — use pre-computed texture tag when available, then
+    # add specific draw markers (FD-x, paired) on top.
     if not board:
         bf = "[]"
     else:
@@ -290,7 +714,10 @@ def _build_reasoning(action: str, equity: float, pot_odds: float,
         ranks = [c[0].upper() for c in board]
         if len(set(ranks)) < len(ranks):
             feats.append("paired")
-        bf = "[" + ",".join(feats[:3]) + "]" if feats else "[dry]"
+        # Use the caller-supplied texture tag as the base label when no
+        # specific draw markers were found, instead of hard-coding "dry".
+        base = texture if texture else "dry"
+        bf = "[" + ",".join(feats[:3]) + "]" if feats else f"[{base}]"
     ke = f"{int(round(equity * 100))}% eq"[:30]
     if action in ("bet", "raise", "all-in"):
         sr = f"po {int(round(pot_odds * 100))}% sized for FE"[:30]
@@ -561,6 +988,23 @@ def _run_benchmark_loop(
                 if e.status == 400:
                     state["rejection_count"] = state.get("rejection_count", 0) + 1
                     save_state(state)
+                    # Capture the illegal-action fold in telemetry so a hand we
+                    # lose via this wire fallback is visible (note tags it, and
+                    # records the action decide() *tried* to submit that got 400).
+                    try:
+                        _self_num = table.get("selfSeatNumber") or 0
+                        _seat = next((s for s in (table.get("seats") or [])
+                                      if s.get("seatNumber") == _self_num), {})
+                        _board = list(table.get("boardCards") or [])
+                        _log_decision(
+                            table, "fold", None, 0.0, 0.0,
+                            _compute_position(_self_num, table),
+                            _hand_class(list(_seat.get("holeCards") or [])),
+                            _board_texture(_board) if _board else "neutral",
+                            _street_from_board(_board), research_context,
+                            note=f"wire_400_fallback(rejected={action.get('action')})")
+                    except Exception:
+                        pass
                     try:
                         client.post("/texas/action", {
                             "tableId": table["tableId"],

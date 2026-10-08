@@ -142,16 +142,27 @@ def _call_llm(system: str, user: str, max_tokens: int,
     if os.environ.get("OPENAI_API_KEY"):
         try:
             from openai import OpenAI  # type: ignore
-            client = OpenAI()
+            base_url = os.environ.get("OPENAI_BASE_URL") or None
+            extra_headers = {}
+            if base_url and "openrouter.ai" in base_url:
+                extra_headers = {
+                    "HTTP-Referer": os.environ.get("OPENROUTER_REFERER", "https://arena.dev.fun"),
+                    "X-Title": os.environ.get("OPENROUTER_TITLE", "poker-arena-agent"),
+                }
+            client = OpenAI(base_url=base_url) if base_url else OpenAI()
+            default_model = (os.environ.get("OPENROUTER_MODEL")
+                             or os.environ.get("OPENAI_MODEL") or "gpt-5")
             resp = client.chat.completions.create(
-                model=model_hint or "gpt-5",
+                model=model_hint or default_model,
                 max_completion_tokens=max_tokens,
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
-                ])
+                ],
+                extra_headers=extra_headers or None)
             return (resp.choices[0].message.content or "").strip()
-        except Exception:
+        except Exception as e:
+            print(f"[llm_agent] openai-compat call failed: {e}", file=sys.stderr)
             return None
 
     return None

@@ -1,8 +1,12 @@
 # Secrets
 .env
-.arena-credentials
-.arena-poker-state
-.arena-poker-state.tmp
+.arena-credentials*
+.arena-poker-state*
+
+# Telemetry and run logs
+*.log
+*.jsonl
+failure_report.txt
 
 # v0.15 onboarding milestone state (per-project, local)
 .pokerkit-milestones.json
